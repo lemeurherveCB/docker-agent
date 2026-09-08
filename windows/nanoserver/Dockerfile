@@ -23,6 +23,29 @@
 #  THE SOFTWARE.
 
 ARG WINDOWS_VERSION_TAG=ltsc2019
+
+## setpd-builder: compile setpd.exe from source using w64devkit (MinGW).
+## setpd.exe calls LsaSetInformationPolicy(PolicyPrimaryDomainInformation) to write
+## "WORKGROUP" into the volatile HKLM\SECURITY hive of nanoserver-ltsc2025.  Docker's
+## windowsfilter driver captures the registry change when committing the layer so it
+## persists in subsequent containers.  The compiler is discarded; only the exe is copied.
+## See: https://github.com/microsoft/Windows-Containers/issues/640
+FROM mcr.microsoft.com/windows/servercore:"${WINDOWS_VERSION_TAG}" AS setpd-builder
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+COPY windows/nanoserver/setpd.c C:/setpd.c
+ARG W64DEVKIT_VERSION=1.23.0
+RUN $url = ('https://github.com/skeeto/w64devkit/releases/download/v{0}/w64devkit-{0}.zip' -f $env:W64DEVKIT_VERSION) ; `
+    Write-Host "Downloading w64devkit $env:W64DEVKIT_VERSION..." ; `
+    Invoke-WebRequest $url -OutFile C:\w64.zip ; `
+    Expand-Archive C:\w64.zip -DestinationPath C:\w64 ; `
+    Remove-Item C:\w64.zip ; `
+    Write-Host "Compiling setpd.c..." ; `
+    $env:PATH = 'C:\w64\w64devkit\bin;' + $env:PATH ; `
+    & "C:\w64\w64devkit\bin\gcc.exe" C:\setpd.c -o C:\setpd.exe -municode -ladvapi32 -static ; `
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ; `
+    Remove-Item -Recurse -Force C:\w64 ; `
+    Write-Host "setpd.exe compiled successfully."
+
 FROM mcr.microsoft.com/windows/servercore:"${WINDOWS_VERSION_TAG}" AS jdk-pwsh
 
 # $ProgressPreference: https://github.com/PowerShell/PowerShell/issues/2138#issuecomment-251261324
@@ -57,14 +80,22 @@ ENV JAVA_HOME="C:/openjdk-${JAVA_RELEASE}"
 ENV PSHOME="C:\Program Files\PowerShell"
 ENV PATH="C:\Windows\system32;C:\Windows;${PSHOME};"
 
-# The nanoserver image lacks components required for the local user account setup below
-COPY --from=jdk-pwsh /windows/system32/netapi32.dll /windows/system32/netapi32.dll
+# The nanoserver image lacks some components required for the local user account setup below.
 COPY --from=jdk-pwsh /windows/system32/whoami.exe /windows/system32/whoami.exe
 COPY --from=jdk-pwsh $JAVA_HOME $JAVA_HOME
 COPY --from=jdk-pwsh /pwsh $PSHOME
+# nanoserver-ltsc2019 and ltsc2022 lack netapi32.dll; ltsc2025 has a protected stub.
+# COPY can't overwrite protected files, so stage to a temp path and move via RUN.
+COPY --from=jdk-pwsh /windows/system32/netapi32.dll C:/netapi32.dll
 
 SHELL ["pwsh.exe", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 USER ContainerAdministrator
+
+RUN if (!(Test-Path 'C:\Windows\System32\netapi32.dll')) { `
+        Move-Item 'C:\netapi32.dll' 'C:\Windows\System32\netapi32.dll' `
+    } else { `
+        Remove-Item 'C:\netapi32.dll' `
+    }
 
 ARG GIT_VERSION=2.55.0
 ARG GIT_PATCH_VERSION=5
@@ -116,10 +147,21 @@ RUN [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tl
     if ((Get-FileHash (Join-Path C:/ProgramData/Jenkins $env:AGENT_FILENAME) -Algorithm SHA1).Hash -ne (Get-Content (Join-Path C:/ProgramData/Jenkins $env:AGENT_HASH_FILENAME))) {exit 1} ; `
     Remove-Item -Force (Join-Path C:/ProgramData/Jenkins $env:AGENT_HASH_FILENAME)
 
+# nanoserver-ltsc2025 ships with a volatile (no backing store) HKLM\SECURITY hive, causing
+# ERROR_NO_SUCH_DOMAIN (0x54b / 1355) for any LogonUser / CreateProcessAsUser call.
+# setpd.exe calls LsaSetInformationPolicy(PolicyPrimaryDomainInformation) as
+# ContainerAdministrator; Docker's windowsfilter driver captures the registry change when
+# committing the layer, so USER jenkins works at both build time AND container start.
+# This is a no-op on ltsc2019/ltsc2022 (WORKGROUP is already set).
+# See: https://github.com/microsoft/Windows-Containers/issues/640
+COPY --from=setpd-builder /setpd.exe /setpd.exe
+RUN & C:\setpd.exe WORKGROUP ; `
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ; `
+    Remove-Item C:\setpd.exe
 USER $user
 
-RUN New-Item -Type Directory $('{0}/.jenkins' -f $env:AGENT_ROOT) | Out-Null ; `
-    New-Item -Type Directory $env:AGENT_WORKDIR | Out-Null
+RUN New-Item -Type Directory -Force $('{0}/.jenkins' -f $env:AGENT_ROOT) | Out-Null ; `
+    New-Item -Type Directory -Force $env:AGENT_WORKDIR | Out-Null
 
 RUN git config --system core.longpaths true ; `
     Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -type DWord -Value 1
@@ -128,6 +170,7 @@ VOLUME "${AGENT_ROOT}"/.jenkins
 VOLUME "${AGENT_WORKDIR}"
 WORKDIR "${AGENT_ROOT}"
 ENV USER=${user}
+ENV USERNAME=${user}
 LABEL `
     org.opencontainers.image.vendor="Jenkins project" `
     org.opencontainers.image.title="Official Jenkins Agent Base Docker image" `

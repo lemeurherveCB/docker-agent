@@ -1,0 +1,32 @@
+# escape=`
+
+# Minimal test: does setpd.exe at build time allow USER jenkins at runtime?
+# Build:  docker build --build-arg WINDOWS_VERSION_TAG=ltsc2025 -t setpd-test
+#                      -f windows/nanoserver/Dockerfile.setpd-test .
+# Run:    docker run --rm setpd-test
+# Expect: output contains "jenkins" (e.g. "user manager\jenkins")
+
+ARG WINDOWS_VERSION_TAG=ltsc2025
+
+FROM mcr.microsoft.com/windows/servercore:"${WINDOWS_VERSION_TAG}" AS setpd-builder
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+COPY windows/nanoserver/setpd.c C:/setpd.c
+ARG W64DEVKIT_VERSION=1.23.0
+RUN $url = ('https://github.com/skeeto/w64devkit/releases/download/v{0}/w64devkit-{0}.zip' -f $env:W64DEVKIT_VERSION) ; `
+    Invoke-WebRequest $url -OutFile C:\w64.zip ; `
+    Expand-Archive C:\w64.zip -DestinationPath C:\w64 ; `
+    Remove-Item C:\w64.zip ; `
+    $env:PATH = 'C:\w64\w64devkit\bin;' + $env:PATH ; `
+    & "C:\w64\w64devkit\bin\gcc.exe" C:\setpd.c -o C:\setpd.exe -municode -ladvapi32 -static ; `
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } ; `
+    Remove-Item -Recurse -Force C:\w64
+
+FROM mcr.microsoft.com/windows/nanoserver:"${WINDOWS_VERSION_TAG}"
+USER ContainerAdministrator
+RUN net user jenkins /add /expire:never /passwordreq:no
+RUN net localgroup Administrators /add jenkins
+COPY --from=setpd-builder /setpd.exe C:/setpd.exe
+RUN C:\setpd.exe WORKGROUP
+RUN del C:\setpd.exe
+USER jenkins
+CMD ["cmd.exe", "/c", "echo USERNAME=%USERNAME%"]

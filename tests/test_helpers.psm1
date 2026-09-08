@@ -77,8 +77,8 @@ function Cleanup($name='') {
     }
 
     if (![System.String]::IsNullOrWhiteSpace($name)) {
-        docker kill "$name" 2>&1 | Out-Null
-        docker rm -fv "$name" 2>&1 | Out-Null
+        try { docker kill "$name" 2>&1 | Out-Null } catch {}
+        try { docker rm -fv "$name" 2>&1 | Out-Null } catch {}
     }
 }
 
@@ -150,5 +150,5 @@ try {
 }
 
 function CleanupNetwork($name) {
-    docker network rm $name 2>&1 | Out-Null
+    try { docker network rm $name 2>&1 | Out-Null } catch {}
 }
